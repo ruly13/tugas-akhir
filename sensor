@@ -1,0 +1,171 @@
+import os
+import serial
+import time
+import json
+import requests
+from datetime import datetime
+from tuya_connector import TuyaOpenAPI
+import firebase_admin
+from firebase_admin import credentials
+import tkinter as tk
+from tkinter import ttk
+
+# ----------------------------------
+# DETEKSI GUI
+# ----------------------------------
+
+use_gui = bool(os.environ.get("DISPLAY"))
+
+if use_gui:
+    root = tk.Tk()
+    root.title("Monitoring Sensor IoT")
+    root.geometry("400x300")
+
+    label_data = tk.Label(root, text="Menunggu data...", font=("Helvetica", 12), justify="left")
+    label_data.pack(pady=20)
+
+# ----------------------------------
+# KONFIGURASI
+# ----------------------------------
+
+# Firebase Realtime Database
+FIREBASE_URL = "https://tugas-akhir-gua-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+# Tuya API Credentials (JANGAN dipublikasi jika real)
+TUYA_ACCESS_ID = "7khd4jcpdcwae3k7d8wj"
+TUYA_ACCESS_KEY = "393c22825c704470bc7486e9ff18dbd9"
+TUYA_DEVICE_ID = "eb74ce20a4136aaf8cgwcn"
+
+# Serial Port (ESP32)
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200
+
+# ----------------------------------
+# INISIALISASI FIREBASE
+# ----------------------------------
+
+cred = credentials.Certificate("fb/service.json")
+firebase_admin.initialize_app(cred, {
+    'databaseURL': FIREBASE_URL
+})
+
+# ----------------------------------
+# FUNGSI UPDATE FIREBASE
+# ----------------------------------
+
+def update_firebase(path, data):
+    try:
+        url = f"{FIREBASE_URL}/{path}.json"
+        response = requests.patch(url, json=data)
+        if response.status_code == 200:
+            print(f"✅ Firebase updated at '{path}'")
+        else:
+            print(f"❌ Gagal update Firebase: {response.status_code} - {response.text}")
+    except Exception as e:
+        print("❌ Error update Firebase:", e)
+
+# ----------------------------------
+# INISIALISASI TUYA OPENAPI
+# ----------------------------------
+
+openapi = TuyaOpenAPI(
+    "https://openapi.tuyaus.com",  # Western America Data Center
+    TUYA_ACCESS_ID,
+    TUYA_ACCESS_KEY
+)
+openapi.connect()
+
+def get_tuya_data():
+    try:
+        response = openapi.get(f"/v1.0/iot-03/devices/{TUYA_DEVICE_ID}/status")
+        if "result" in response:
+            desired_keys = ["add_ele", "cur_power", "switch_1"]
+            tuya_data = {
+                item['code']: item['value']
+                for item in response['result']
+                if item['code'] in desired_keys
+            }
+            return tuya_data
+        else:
+            print("⚠️ Gagal ambil data Tuya:", response)
+            return {}
+    except Exception as e:
+        print("❌ Error Tuya API:", e)
+        return {}
+
+# ----------------------------------
+# MAIN LOOP
+# ----------------------------------
+
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    print("✅ Serial ESP32 terkoneksi.")
+except Exception as e:
+    print("❌ Gagal membuka serial:", e)
+    exit()
+
+try:
+    while True:
+        try:
+            line = ser.readline().decode('utf-8').strip()
+            if not line:
+                continue
+
+            print("📥 Data dari ESP32:", line)
+
+            with open("log.txt", "a") as log_file:
+                log_file.write(f"{datetime.now().isoformat()} - RAW: {line}\n")
+
+            # Parse JSON
+            data = json.loads(line)
+            is_esp32_data = all(k in data for k in [
+                "suhu_1", "suhu_2", "suhu_3", "suhu_4",
+                "rata_suhu", "kelembaban_1", "kelembaban_2", "rata_kelembaban"
+            ])
+
+            if is_esp32_data:
+                data["timestamp"] = datetime.now().isoformat()
+
+                # Ambil data dari Tuya
+                tuya_data = get_tuya_data()
+                data.update(tuya_data)
+
+                # Status ON/OFF
+                data["pengering_status"] = "ON" if tuya_data.get("switch_1") else "OFF"
+
+                # Kirim ke Firebase
+                update_firebase("sensor", data)
+                
+                # Update GUI jika tersedia
+                if use_gui:
+                    tampil = (
+                        f"Suhu Rata-rata: {data.get('rata_suhu', '-')}\n"
+                        f"Kelembapan Rata-rata: {data.get('rata_kelembaban', '-')}\n"
+                        f"Daya Saat Ini: {data.get('cur_power', '-')} W\n"
+                        f"Total Energi: {data.get('add_ele', '-')} kWh\n"
+                        f"Status Pengering: {data.get('pengering_status', '-')}"
+                    )
+                    label_data.config(text=tampil)
+                    root.update_idletasks()
+
+            else:
+                print("⚠️ Data ESP32 tidak lengkap, dilewati.\n")
+
+            # Update GUI
+            if use_gui:
+                root.update()
+
+            time.sleep(5)
+
+        except json.JSONDecodeError:
+            print("⚠️ Format JSON salah, dilewati.\n")
+        except Exception as e:
+            print("❌ Error saat memproses data:", e, "\n")
+
+except KeyboardInterrupt:
+    print("\n🛑 Program dihentikan oleh pengguna.")
+    ser.close()
+
+    if use_gui:
+        root.quit()
+
